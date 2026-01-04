@@ -1,90 +1,102 @@
 import os
-from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_ollama import OllamaEmbeddings
-from langchain_neo4j import Neo4jGraph
+import json
+import numpy as np
+from neo4j import GraphDatabase
+from sentence_transformers import SentenceTransformer
+from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq  # ✅ using Groq instead of OpenAI
+import faiss
 
-# --- Load environment variables create your own .env file---
-load_dotenv()
+# ========= CONFIGURATION ==========
+NEO4J_URI = "neo4j://127.0.0.1:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASS = "kg1_2345"
+FAISS_DIR = "faiss_index"
+GROQ_API_KEY = "API key"  # 👈 replace with yours
+# ==================================
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.getenv("NEO4J_PASS", "llm12345")
+# ---- Step 1: Connect to Neo4j and pull embeddings ----
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+with driver.session() as session:
+    records = session.run("""
+        MATCH (n)
+        WHERE n.embedding IS NOT NULL
+        RETURN id(n) AS id, n.name AS name, n.embedding AS embedding
+    """).data()
 
-if not GROQ_API_KEY:
-    raise RuntimeError("❌ GROQ_API_KEY not found in .env")
+print(f"✅ Loaded {len(records)} nodes with embeddings from Neo4j.")
 
-# --- Initialize Groq LLM ---
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",  # or "mixtral-8x7b-32768"
-    temperature=0,
-    api_key=GROQ_API_KEY,
-)
+# ---- Step 2: Prepare FAISS index ----
+dim = len(records[0]['embedding'])
+embeddings_np = np.array([r['embedding'] for r in records]).astype('float32')
 
-# --- Initialize Ollama Embeddings (nomic-embed-text) ---
-embeddings = OllamaEmbeddings(model="nomic-embed-text:latest")
-print("✅ Using Ollama embeddings: nomic-embed-text:latest")
+if not os.path.exists(FAISS_DIR):
+    os.makedirs(FAISS_DIR, exist_ok=True)
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings_np)
+    faiss.write_index(index, os.path.join(FAISS_DIR, "index.faiss"))
+    with open(os.path.join(FAISS_DIR, "meta.json"), "w") as f:
+        json.dump([{"id": r["id"], "name": r["name"]} for r in records], f)
+    print("🧩 Created new FAISS index and metadata.")
+else:
+    index = faiss.read_index(os.path.join(FAISS_DIR, "index.faiss"))
+    with open(os.path.join(FAISS_DIR, "meta.json"), "r") as f:
+        metadata = json.load(f)
+    print("📦 Loaded existing FAISS index.")
 
-# --- Neo4j connection ---
-graph = Neo4jGraph(
-    url=NEO4J_URI,
-    username=NEO4J_USER,
-    password=NEO4J_PASS,
-)
+# ---- Step 3: Prepare embedder + LLM ----
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+llm = ChatGroq(model="llama-3.1-8b-instant", api_key=GROQ_API_KEY, temperature=0)
 
-# --- Function: query KG using embedding ---
-def query_kg_with_embedding(user_query: str):
-    # Convert query into embedding
-    query_embedding = embeddings.embed_query(user_query)
+# ---- Step 4: Continuous Query Loop ----
+print("\n🤖 Chatbot ready! Type your questions below.")
+print("Type 'exit' to quit.\n")
 
-    # Run Cypher similarity search (make sure embeddings are stored in Neo4j nodes as `e.embedding`)
-    cypher = """
-    MATCH (e:Entity)
-    WITH e, gds.similarity.cosine(e.embedding, $query_embedding) AS score
-    ORDER BY score DESC
-    LIMIT 3
-    RETURN e.name AS name, score
+while True:
+    query = input("You: ").strip()
+    if query.lower() == "exit":
+        print("👋 Exiting chatbot. Goodbye!")
+        break
+
+    # Embed the query
+    query_vector = embedder.encode(query).astype('float32').reshape(1, -1)
+    k = 5
+    distances, indices = index.search(query_vector, k)
+    top_nodes = [metadata[i] for i in indices[0]]
+
+    print("\n🔍 Top matches from KG:")
+    for i, node in enumerate(top_nodes):
+        print(f"{i+1}. {node['name']} (distance={distances[0][i]:.4f})")
+
+    # Fetch relationships for context
+    with driver.session() as session:
+        node_ids = [n['id'] for n in top_nodes]
+        context_records = session.run("""
+            MATCH (a)-[r]->(b)
+            WHERE id(a) IN $ids
+            RETURN a.name AS source, type(r) AS relation, b.name AS target
+        """, ids=node_ids).data()
+
+    context_text = "\n".join(
+        [f"{r['source']} -[{r['relation']}]-> {r['target']}" for r in context_records]
+    )
+
+    # Ask Groq LLM
+    prompt = f"""
+    Use the following graph facts to answer the user's question.
+
+    Graph Context:
+    {context_text}
+
+    User Question:
+    {query}
+
+    Answer in concise form:
     """
-    result = graph.query(cypher, params={"query_embedding": query_embedding})
-    return result
 
-# --- Function: full query system ---
-def query_system(user_query: str):
-    matches = query_kg_with_embedding(user_query)
+    response = llm.invoke(prompt)
+    print("\n💬 LLM Answer:\n", response.content)
+    print("-" * 80)
 
-    if matches and len(matches) > 0:
-        entities = [record["name"] for record in matches]
-        context = ", ".join(entities)
+driver.close()
 
-        prompt = f"""
-        The user asked: "{user_query}"
-        The knowledge graph returned related entities: {context}.
-        Please frame a helpful and natural answer using this context.
-        """
-        response = llm.invoke(prompt)
-        return response.content if hasattr(response, "content") else str(response)
-    else:
-        # Fallback to LLM knowledge
-        response = llm.invoke(
-            f"The knowledge graph has no answer. Based on your knowledge, answer this: {user_query}"
-        )
-        return response.content if hasattr(response, "content") else str(response)
-
-# --- Chatbot loop ---
-def chatbot():
-    print("\n🌱 Welcome to Krishi.AI! (Groq LLM + Neo4j + Ollama embeddings) 🌾\n")
-    while True:
-        user_query = input("🧑 You: ").strip()
-        if not user_query or user_query.lower() in ("exit", "quit"):
-            print("🌱 KrishiAI: Bye 👋")
-            break
-
-        try:
-            answer = query_system(user_query)
-            print(f"🌱 KrishiAI: {answer}\n")
-        except Exception as e:
-            print("⚠️ Error:", e)
-
-if __name__ == "__main__":
-    chatbot()
